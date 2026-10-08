@@ -1,0 +1,9 @@
+# dsh-margin bundle patch: inserts the dual-face plugin row into the web
+# profile roster. Activated with `dsh plugin --profile web add .` (or a
+# github: / link: spec) — the node half runs in the host process (Margin HTTP
+# client, agent tools, config store, /api/dsh-margin routes), and the
+# dsh.client declaration loads the browser half (reading-list panel +
+# 设置 → Margin card).
+- insert:
+    - id: margin
+      name: 'dsh-margin'
