@@ -45,6 +45,22 @@ export const Config = z.object({
   announceToAgent: z.boolean().default(true).volatile(),
 })
 
+/**
+ * Read one boolean config switch.
+ *
+ * Cordis hands volatile fields to apply() as `Volatile<boolean>` references
+ * (an object with `get()`), not as plain booleans — so `if (config.x)` is
+ * always true and a switch can never be turned off. Accept both shapes so the
+ * plugin works under the real loader and under a hand-built test context.
+ */
+function readSwitch(value: boolean | Volatile<boolean> | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback
+  if (typeof value === 'boolean') return value
+  const reference = value as Volatile<boolean>
+  if (typeof reference.get === 'function') return reference.get() === true
+  return fallback
+}
+
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 154
 
@@ -78,7 +94,9 @@ const MARGIN_GUIDANCE = [
 
 /** Mount the Margin surfaces. */
 export function apply(ctx: Context, config: Config): void {
-  if (!config.enabled) return
+  if (!readSwitch(config.enabled, true)) return
+  const allowWrites = readSwitch(config.allowWrites, false)
+  const announce = readSwitch(config.announceToAgent, true)
 
   const getClient = (): MarginClient | undefined => client()
 
@@ -93,14 +111,14 @@ export function apply(ctx: Context, config: Config): void {
   // Agent tools. Read-only always; the write tool is opt-in.
   ctx.effect(() => {
     const factories = [marginListTool(getClient), marginGetTool(getClient)]
-    if (config.allowWrites) factories.push(marginMarkReadTool(getClient))
+    if (allowWrites) factories.push(marginMarkReadTool(getClient))
     const disposers = factories.map(factory => ctx.tools.register(factory))
     return () => {
       for (const dispose of disposers) dispose()
     }
   }, 'dsh-margin: margin_* tools')
 
-  if (config.announceToAgent) {
+  if (announce) {
     ctx.systemPrompt.section({
       name: 'plugin:dsh-margin',
       order: SECTION_ORDER,
