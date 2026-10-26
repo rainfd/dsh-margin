@@ -2,9 +2,8 @@
  * Route tests: the /api/dsh-margin family, driven through makeRoutes() with a
  * fake Margin behind it.
  *
- * These assert the two things that would be a security or data problem in
- * production: a non-loopback caller must be refused (403) on every route, and
- * the token must never appear in any response body.
+ * These assert the security boundary: every exact route delegates admission
+ * to DSH Connection, rejects untrusted requests, and never returns the Margin token.
  */
 
 import { test } from 'node:test'
@@ -18,8 +17,19 @@ const dir = mkdtempSync(join(tmpdir(), 'dsh-margin-routes-'))
 process.env.DSH_MARGIN_CONFIG = join(dir, 'dsh-margin.json')
 
 const TOKEN = 'super-secret-token-value'
-const routes = (await import('../lib/routes.js')).makeRoutes()
 const store = await import('../lib/store.js')
+const { makeRoutes } = await import('../lib/routes.js')
+const connection = {
+  requestRejection(req) {
+    if (req.headers['x-test-reject'] === '401') return 401
+    if (req.headers['x-test-reject'] === '403' || req.headers['sec-fetch-site'] === 'cross-site') return 403
+    const origin = req.headers.origin
+    const host = req.headers.host
+    if (origin !== undefined && host !== undefined && new URL(origin).host !== host) return 403
+    return undefined
+  },
+}
+const routes = makeRoutes(connection)
 
 store.writeConfig({ baseUrl: 'http://127.0.0.1:1', token: TOKEN, timeoutMs: 1000 })
 
@@ -48,10 +58,11 @@ function row(overrides = {}) {
  * Start a fake Margin and mount the plugin's routes on a local server, so
  * requests take the real socket path (and therefore the real remoteAddress).
  */
-async function withRoutes(marginHandler, run) {
-  const margin = createServer((req, res) => {
+async function withRoutes(marginHandler, run, permissions = {}) {
+  const activeRoutes = makeRoutes(connection, permissions)
+  const margin = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')
-    const result = marginHandler(url)
+    const result = await marginHandler(url, req)
     res.writeHead(result.status ?? 200, { 'content-type': 'application/json' })
     res.end(JSON.stringify(result.body ?? {}))
   })
@@ -59,7 +70,7 @@ async function withRoutes(marginHandler, run) {
   const marginPort = margin.address().port
 
   const host = createServer((req, res) => {
-    const route = routes.find(candidate => req.url.split('?')[0] === candidate.path)
+    const route = activeRoutes.find(candidate => req.url.split('?')[0] === candidate.path)
     if (route === undefined) {
       res.writeHead(404)
       res.end()
@@ -146,14 +157,16 @@ test('GET /candidates 返回待读视图与来源分布', async () => {
     url => ({
       body: {
         items: [row({ id: 1, source_type: 'rss' }), row({ id: 2, source_type: 'wechat' })],
-        pagination: { page: 1, page_size: 100, total: 88, total_pages: 1 },
+        pagination: { page: 1, page_size: 100, total: 2, total_pages: 1 },
       },
     }),
     async ({ call, marginPort }) => {
       store.writeConfig({ baseUrl: `http://127.0.0.1:${marginPort}`, token: TOKEN, timeoutMs: 3000 })
       const result = await call('/api/dsh-margin/candidates?limit=10')
       assert.equal(result.status, 200)
-      assert.equal(result.body.total, 88)
+      assert.equal(result.body.total, 2)
+      assert.equal(result.body.totalExact, true)
+      assert.equal(result.body.writesAllowed, false)
       assert.equal(result.body.items.length, 2)
       assert.equal(result.body.applied.status, 'unprocessed')
       assert.deepEqual(result.body.breakdown.map(b => b.sourceType).sort(), ['rss', 'wechat'])
@@ -182,6 +195,26 @@ test('Margin 401 透传为 401 margin_unauthorized', async () => {
       assert.equal(result.status, 401)
       assert.equal(result.body.error.code, 'margin_unauthorized')
       assert.equal(JSON.stringify(result.body).includes(TOKEN), false)
+    },
+  )
+})
+
+test('GET /candidate 返回正文，列表不带正文，HTML 与 token 不出边界', async () => {
+  const body = row({ content_md: '# 正文', content_text: '正文', content_fetch_failed: true, content_html: '<script>bad()</script>' })
+  await withRoutes(
+    url => ({ body: url.pathname === '/api/candidates/865' ? body : { items: [body], pagination: { page: 1, page_size: 100, total: 1, total_pages: 1 } } }),
+    async ({ call, marginPort }) => {
+      store.writeConfig({ baseUrl: `http://127.0.0.1:${marginPort}`, token: TOKEN, timeoutMs: 1000 })
+      const detail = await call('/api/dsh-margin/candidate?id=865')
+      assert.equal(detail.status, 200)
+      assert.equal(detail.body.contentMd, '# 正文')
+      assert.equal(detail.body.contentText, '正文')
+      assert.equal(detail.body.contentFetchFailed, true)
+      assert.equal(JSON.stringify(detail.body).includes(TOKEN), false)
+      assert.equal('content_html' in detail.body, false)
+      const list = await call('/api/dsh-margin/candidates')
+      assert.equal(list.status, 200)
+      assert.equal('contentMd' in list.body.items[0], false)
     },
   )
 })
@@ -245,15 +278,40 @@ test('未知方法返回 405', async () => {
 test('path 与已注册路由精确匹配（kind=exact）', () => {
   const paths = routes.map(route => route.path).sort()
   assert.deepEqual(paths, [
+    '/api/dsh-margin/ai-capability',
+    '/api/dsh-margin/ai-run',
+    '/api/dsh-margin/annotations',
     '/api/dsh-margin/candidate',
+    '/api/dsh-margin/candidate-status',
     '/api/dsh-margin/candidates',
     '/api/dsh-margin/config',
+    '/api/dsh-margin/credential-create',
+    '/api/dsh-margin/credential-delete',
+    '/api/dsh-margin/highlight-create',
+    '/api/dsh-margin/highlight-delete',
+    '/api/dsh-margin/highlight-link',
+    '/api/dsh-margin/import-pdf',
+    '/api/dsh-margin/import-task',
+    '/api/dsh-margin/import-url',
+    '/api/dsh-margin/imports',
+    '/api/dsh-margin/management',
+    '/api/dsh-margin/note-create',
+    '/api/dsh-margin/note-delete',
+    '/api/dsh-margin/note-update',
+    '/api/dsh-margin/progress',
+    '/api/dsh-margin/progress-clear',
+    '/api/dsh-margin/save-state',
+    '/api/dsh-margin/save-trilium',
+    '/api/dsh-margin/source-create',
+    '/api/dsh-margin/source-delete',
+    '/api/dsh-margin/source-fetch',
+    '/api/dsh-margin/source-update',
     '/api/dsh-margin/test',
   ])
   assert.equal(routes.every(route => route.kind === 'exact'), true)
 })
 
-test('非 loopback 来源被拒绝（cross-site）对所有路由生效', async () => {
+test('所有精确路由都委托 DSH Connection 拒绝跨站请求', async () => {
   await withRoutes(
     () => ({ body: {} }),
     async ({ hostPort }) => {
@@ -263,6 +321,10 @@ test('非 loopback 来源被拒绝（cross-site）对所有路由生效', async 
         ['POST', '/api/dsh-margin/test'],
         ['GET', '/api/dsh-margin/candidates'],
         ['GET', '/api/dsh-margin/candidate?id=1'],
+        ['PATCH', '/api/dsh-margin/candidate-status'],
+        ['GET', '/api/dsh-margin/management'],
+        ['POST', '/api/dsh-margin/source-create'],
+        ['POST', '/api/dsh-margin/credential-create'],
       ]
       for (const [method, path] of cases) {
         const response = await fetch(`http://127.0.0.1:${hostPort}${path}`, {
@@ -275,7 +337,25 @@ test('非 loopback 来源被拒绝（cross-site）对所有路由生效', async 
         })
         const body = await response.json()
         assert.equal(response.status, 403, `${method} ${path} 应为 403`)
-        assert.equal(body.error.message, 'forbidden: loopback-only')
+        assert.equal(body.error, 'forbidden: same-origin request required')
+      }
+    },
+  )
+})
+
+test('所有精确路由都透传 DSH Connection 的未登录状态', async () => {
+  await withRoutes(
+    () => ({ body: {} }),
+    async ({ hostPort }) => {
+      for (const path of [
+        '/api/dsh-margin/config', '/api/dsh-margin/test',
+        '/api/dsh-margin/candidates', '/api/dsh-margin/candidate?id=1', '/api/dsh-margin/candidate-status',
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${hostPort}${path}`, {
+          headers: { 'x-test-reject': '401' },
+        })
+        assert.equal(response.status, 401, path)
+        assert.equal((await response.json()).error, 'unauthorized')
       }
     },
   )
@@ -291,6 +371,87 @@ test('跨源 Origin 被拒绝', async () => {
       assert.equal(response.status, 403)
     },
   )
+})
+
+test('状态写路径默认拒绝且不触发任何上游请求', async () => {
+  let requests = 0
+  await withRoutes(() => { requests++; return { body: {} } }, async ({ call }) => {
+    const result = await call('/api/dsh-margin/candidate-status', { method: 'PATCH', body: '{}' })
+    assert.equal(result.status, 403)
+    assert.equal(result.body.error.code, 'writes_disabled')
+    assert.equal(requests, 0)
+  })
+})
+
+test('状态写入显式、幂等、返回部分确认；权限撤销立即生效', async () => {
+  let allowed = true
+  const seen = []
+  await withRoutes(async (url, req) => {
+    let text = ''; for await (const chunk of req) text += chunk
+    const body = JSON.parse(text)
+    seen.push({ path: url.pathname, method: req.method, body })
+    return { body: { id: 865, status: body.status, is_saved_to_trilium: false, updated_at: 'now' } }
+  }, async ({ call, marginPort }) => {
+    const baseUrl = `http://127.0.0.1:${marginPort}`
+    store.writeConfig({ baseUrl, token: TOKEN, timeoutMs: 1000 })
+    const write = status => call('/api/dsh-margin/candidate-status', {
+      method: 'PATCH', body: JSON.stringify({ id: 865, status, marginUrl: `${baseUrl}/reader/865` }),
+    })
+    for (const status of ['read', 'read', 'unprocessed']) {
+      const result = await write(status)
+      assert.equal(result.status, 200)
+      assert.deepEqual(result.body, { id: 865, status, isSavedToTrilium: false, updatedAt: 'now' })
+      assert.equal('title' in result.body, false)
+      assert.equal(JSON.stringify(result.body).includes(TOKEN), false)
+    }
+    assert.deepEqual(seen.map(r => r.body.status), ['read', 'read', 'unprocessed'])
+    assert.ok(seen.every(r => r.path === '/api/candidates/865/status' && r.method === 'PATCH'))
+    allowed = false
+    assert.equal((await write('read')).status, 403)
+    assert.equal(seen.length, 3)
+  }, { allowWrites: () => allowed })
+})
+
+test('非法目标、ID、实例或请求体在写入前拒绝', async () => {
+  let requests = 0
+  await withRoutes(() => { requests++; return { body: {} } }, async ({ call, marginPort }) => {
+    const baseUrl = `http://127.0.0.1:${marginPort}`
+    store.writeConfig({ baseUrl, token: TOKEN, timeoutMs: 1000 })
+    const valid = { id: 865, status: 'read', marginUrl: `${baseUrl}/reader/865` }
+    for (const body of [null, [], {}, { ...valid, id: '865' }, { ...valid, id: 0 }, { ...valid, id: 1.5 }, { ...valid, status: 'error' }, { ...valid, status: 'processing' }, { ...valid, extra: true }]) {
+      assert.equal((await call('/api/dsh-margin/candidate-status', { method: 'PATCH', body: JSON.stringify(body) })).status, 400)
+    }
+    assert.equal((await call('/api/dsh-margin/candidate-status', { method: 'PATCH', body: '{bad' })).status, 400)
+    assert.equal((await call('/api/dsh-margin/candidate-status', { method: 'PATCH', body: JSON.stringify({ ...valid, marginUrl: 'http://other/reader/865' }) })).status, 409)
+    assert.equal((await call('/api/dsh-margin/candidate-status')).status, 405)
+    assert.equal(requests, 0)
+  }, { allowWrites: () => true })
+})
+
+test('读请求返回实时写权限；分页参数/状态校验生效', async () => {
+  let allowed = true
+  await withRoutes(() => ({ body: { items: [row()], pagination: { page: 1, page_size: 100, total: 1, total_pages: 1 } } }), async ({ call, marginPort }) => {
+    store.writeConfig({ baseUrl: `http://127.0.0.1:${marginPort}`, token: TOKEN, timeoutMs: 1000 })
+    assert.equal((await call('/api/dsh-margin/candidates')).body.writesAllowed, true)
+    allowed = false
+    assert.equal((await call('/api/dsh-margin/candidates')).body.writesAllowed, false)
+    assert.equal((await call('/api/dsh-margin/candidates?page=1.5')).status, 400)
+    assert.equal((await call('/api/dsh-margin/candidates?status=bad')).status, 400)
+    const clamped = await call('/api/dsh-margin/candidates?page=99&limit=1')
+    assert.equal(clamped.body.page, 1)
+  }, { allowWrites: () => allowed })
+})
+
+test('写权限在读完请求体后再次检查', async () => {
+  let requests = 0, checks = 0
+  await withRoutes(() => { requests++; return { body: {} } }, async ({ call, marginPort }) => {
+    const baseUrl = `http://127.0.0.1:${marginPort}`
+    store.writeConfig({ baseUrl, token: TOKEN, timeoutMs: 1000 })
+    const result = await call('/api/dsh-margin/candidate-status', { method: 'PATCH', body: JSON.stringify({ id: 865, status: 'read', marginUrl: `${baseUrl}/reader/865` }) })
+    assert.equal(result.status, 403)
+    assert.equal(checks, 2)
+    assert.equal(requests, 0)
+  }, { allowWrites: () => ++checks === 1 })
 })
 
 test('同源 Origin 被接受', async () => {

@@ -3,28 +3,30 @@
  * the /api/dsh-margin route family the browser half calls, and the margin_*
  * agent tools that let a session read the backlog behind the task ledger.
  *
- * Stage 1 is read-only by construction: no route and no tool writes to Margin
- * unless `allowWrites` is switched on in cordis.yml, which registers
- * margin_mark_read. The browser half (./client) renders the reading-list panel
- * (设置 → Margin, sidebar 待读).
+ * Read-only by default. Explicit status assignments require allowWrites;
+ * tools and routes recheck live authorization before every mutation.
+ * The browser half renders the reading workspace and plugin settings.
  */
 
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/dsh-client-connection'
+import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { MarginClient } from './margin.ts'
 import { makeRoutes } from './routes.ts'
+import { lookupLlm } from './aiRoutes.ts'
 import { readConfig } from './store.ts'
-import { marginGetTool, marginListTool, marginMarkReadTool } from './tools.ts'
+import { marginGetTool, marginListTool, marginMarkReadTool, marginMarkUnreadTool } from './tools.ts'
 
 /** Stable cordis plugin name. */
 export const name = 'margin'
 
 /** Services required before the Margin surfaces can mount. */
-export const inject = ['webServer', 'tools', 'systemPrompt']
+export const inject = ['webServer', 'tools', 'systemPrompt', 'connection']
 
 /**
  * Plugin config (cordis.yml). The connection (baseUrl/token/timeoutMs) lives
@@ -35,6 +37,22 @@ export interface Config {
   enabled: Volatile<boolean>
   /** Register margin_mark_read and future write routes. */
   allowWrites: Volatile<boolean>
+  /** Imports additionally require the master write gate; independently default off. */
+  allowUrlImports: Volatile<boolean>
+  allowPdfImports: Volatile<boolean>
+  /** Source and credential management also require the master write gate. */
+  allowSourceWrites: Volatile<boolean>
+  allowCredentialWrites: Volatile<boolean>
+  /** Optional reading assistant. Off by default; must never gate plain reading. */
+  allowAi: Volatile<boolean>
+  /** Optional model target; blank means "first advertised model". */
+  aiProvider: string
+  aiModel: string
+  /** Saving an article to Trilium; separate from the read/unread write gate. */
+  allowTriliumSave: Volatile<boolean>
+  /** User-authored annotations; each is a separate capability. */
+  allowHighlightWrites: Volatile<boolean>
+  allowNoteWrites: Volatile<boolean>
   /** Announce the plugin's capability boundary to the agent. */
   announceToAgent: Volatile<boolean>
 }
@@ -42,6 +60,16 @@ export interface Config {
 export const Config = z.object({
   enabled: z.boolean().default(true).volatile(),
   allowWrites: z.boolean().default(false).volatile(),
+  allowUrlImports: z.boolean().default(false).volatile(),
+  allowPdfImports: z.boolean().default(false).volatile(),
+  allowSourceWrites: z.boolean().default(false).volatile(),
+  allowCredentialWrites: z.boolean().default(false).volatile(),
+  allowAi: z.boolean().default(false).volatile(),
+  aiProvider: z.string().default(''),
+  aiModel: z.string().default(''),
+  allowTriliumSave: z.boolean().default(false).volatile(),
+  allowHighlightWrites: z.boolean().default(false).volatile(),
+  allowNoteWrites: z.boolean().default(false).volatile(),
   announceToAgent: z.boolean().default(true).volatile(),
 })
 
@@ -73,8 +101,9 @@ function client(): MarginClient | undefined {
 
 /**
  * The capability boundary the agent needs in order to not conflate the two
- * systems: Margin is the content store, Trilium is the task ledger, and this
- * plugin only reads the former.
+ * systems: Margin is the content store, Trilium is the task ledger. Mutating
+ * surfaces exist in the GUI only and are never exposed as tools, so the agent
+ * must not claim it can import, save, annotate or answer from an article.
  */
 const MARGIN_GUIDANCE = [
   '## Margin（阅读内容仓）',
@@ -89,7 +118,13 @@ const MARGIN_GUIDANCE = [
   '边界：',
   '- Margin 只承载**链接**；名词类任务（如「整理年度发票」）不属于它，不要尝试为它查 candidate。',
   '- 只有用户明确说读完了，才可以把 candidate 标记为 read（且需要启用写入）。',
+  '- 只有用户明确要求设为未读，才可用 margin_mark_unread（同样需要启用写入）；它不重开 Trilium 任务。',
+  '- 阅读列表使用有界扫描；总数不完整时必须告知截断/已扫描范围，不能称为全库总数。',
   '- `marginCandidateId` 只在所属实例内有效，跨实例 ID 不可混用。',
+  '- **导入/来源/凭据/保存到 Trilium/高亮/笔记/AI 问答只在 GUI 内提供，没有对应工具**；',
+  '  用户要求这些操作时，说明需在阅读界面操作，不要声称已执行。',
+  '- 工具不返回文章正文；需要原文时请用户在阅读器查看，或由用户明确指定少量摘录。',
+  '- 阅读进度只存在本机（按实例+正文版本），不是已读状态；滚动到底不等于读完。',
 ].join('\n')
 
 /** Mount the Margin surfaces. */
@@ -99,10 +134,26 @@ export function apply(ctx: Context, config: Config): void {
   const announce = readSwitch(config.announceToAgent, true)
 
   const getClient = (): MarginClient | undefined => client()
+  const mayWrite = (): boolean => readSwitch(config.enabled, true) && readSwitch(config.allowWrites, false)
 
-  // Routes (loopback-only; see routes.ts).
+  // Routes use DSH Connection's session and Host/Origin checks (see routes.ts).
   ctx.effect(() => {
-    const disposers = makeRoutes().map(route => ctx.webServer.register(route))
+    const disposers = makeRoutes(ctx.connection as HostConnectionHandle, {
+      allowWrites: mayWrite,
+      allowUrlImports: () => mayWrite() && readSwitch(config.allowUrlImports, false),
+      allowPdfImports: () => mayWrite() && readSwitch(config.allowPdfImports, false),
+      allowSourceWrites: () => mayWrite() && readSwitch(config.allowSourceWrites, false),
+      allowCredentialWrites: () => mayWrite() && readSwitch(config.allowCredentialWrites, false),
+      allowAi: () => readSwitch(config.enabled, true) && readSwitch(config.allowAi, false),
+      allowTriliumSave: () => mayWrite() && readSwitch(config.allowTriliumSave, false),
+      allowHighlightWrites: () => mayWrite() && readSwitch(config.allowHighlightWrites, false),
+      allowNoteWrites: () => mayWrite() && readSwitch(config.allowNoteWrites, false),
+    }, {
+      config: { provider: config.aiProvider, model: config.aiModel },
+      // Optional lookup: no `inject` entry, so a missing model service cannot
+      // block plugin activation or plain reading.
+      llm: () => lookupLlm(ctx),
+    }).map(route => ctx.webServer.register(route))
     return () => {
       for (const dispose of disposers) dispose()
     }
@@ -111,7 +162,7 @@ export function apply(ctx: Context, config: Config): void {
   // Agent tools. Read-only always; the write tool is opt-in.
   ctx.effect(() => {
     const factories = [marginListTool(getClient), marginGetTool(getClient)]
-    if (allowWrites) factories.push(marginMarkReadTool(getClient))
+    if (allowWrites) factories.push(marginMarkReadTool(getClient, mayWrite), marginMarkUnreadTool(getClient, mayWrite))
     const disposers = factories.map(factory => ctx.tools.register(factory))
     return () => {
       for (const dispose of disposers) dispose()

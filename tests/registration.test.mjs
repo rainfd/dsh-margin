@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-margin-registration-'))
 process.env.DSH_MARGIN_CONFIG = join(dir, 'dsh-margin.json')
@@ -69,7 +70,7 @@ test('allowWrites:true 才注册 margin_mark_read', () => {
   const { ctx, tools, run } = fakeContext()
   plugin.apply(ctx, { enabled: volatile(true), allowWrites: volatile(true), announceToAgent: volatile(false) })
   run()
-  assert.deepEqual(toolNames(tools), ['margin_get_candidate', 'margin_list_candidates', 'margin_mark_read'])
+  assert.deepEqual(toolNames(tools), ['margin_get_candidate', 'margin_list_candidates', 'margin_mark_read', 'margin_mark_unread'])
 })
 
 test('enabled:false 时什么都不注册', () => {
@@ -80,14 +81,39 @@ test('enabled:false 时什么都不注册', () => {
   assert.equal(sections.length, 0)
 })
 
-test('路由族始终注册 4 条', () => {
+test('路由族始终注册 29 条，写路径仍由权限闸门拒绝', () => {
   const { ctx, routes, run } = fakeContext()
   plugin.apply(ctx, { enabled: volatile(true), announceToAgent: volatile(false) })
   run()
   assert.deepEqual(routes.map(route => route.path).sort(), [
+    '/api/dsh-margin/ai-capability',
+    '/api/dsh-margin/ai-run',
+    '/api/dsh-margin/annotations',
     '/api/dsh-margin/candidate',
+    '/api/dsh-margin/candidate-status',
     '/api/dsh-margin/candidates',
     '/api/dsh-margin/config',
+    '/api/dsh-margin/credential-create',
+    '/api/dsh-margin/credential-delete',
+    '/api/dsh-margin/highlight-create',
+    '/api/dsh-margin/highlight-delete',
+    '/api/dsh-margin/highlight-link',
+    '/api/dsh-margin/import-pdf',
+    '/api/dsh-margin/import-task',
+    '/api/dsh-margin/import-url',
+    '/api/dsh-margin/imports',
+    '/api/dsh-margin/management',
+    '/api/dsh-margin/note-create',
+    '/api/dsh-margin/note-delete',
+    '/api/dsh-margin/note-update',
+    '/api/dsh-margin/progress',
+    '/api/dsh-margin/progress-clear',
+    '/api/dsh-margin/save-state',
+    '/api/dsh-margin/save-trilium',
+    '/api/dsh-margin/source-create',
+    '/api/dsh-margin/source-delete',
+    '/api/dsh-margin/source-fetch',
+    '/api/dsh-margin/source-update',
     '/api/dsh-margin/test',
   ])
 })
@@ -148,6 +174,42 @@ test('volatile 引用取的是当前快照而不是恒真的对象', () => {
   plugin.apply(second.ctx, { enabled: volatile(true), allowWrites: live, announceToAgent: volatile(false) })
   second.run()
   assert.equal(toolNames(second.tools).includes('margin_mark_read'), true)
+})
+
+test('开关撤销后，已注册工具也会按实时权限拒绝执行', async () => {
+  let current = true
+  const instance = fakeContext()
+  plugin.apply(instance.ctx, { enabled: true, allowWrites: { get: () => current }, announceToAgent: false })
+  instance.run()
+  const tool = instance.tools.find(tool => tool.name === 'margin_mark_read')
+  assert.ok(tool)
+  current = false
+  assert.match(await tool.execute({ id: 1 }, {}), /未启用/)
+})
+
+test('导入同时受主写闸门与对应类型开关控制，并实时复查', async () => {
+  let master = false, url = true
+  const instance = fakeContext()
+  instance.ctx.connection = { requestRejection: () => undefined }
+  plugin.apply(instance.ctx, { enabled: true, allowWrites: { get: () => master }, allowUrlImports: { get: () => url }, allowPdfImports: false, announceToAgent: false })
+  instance.run()
+  const route = instance.routes.find(route => route.path.endsWith('/import-url'))
+  const call = async () => {
+    const req = Readable.from([Buffer.from('{}')]); req.method = 'POST'; req.url = '/api/dsh-margin/import-url'; req.headers = {}
+    let status, payload
+    const res = { writeHead: value => { status = value }, end: value => { payload = value } }
+    // The outer exact route intentionally fire-and-forgets its async handler.
+    route.handler(req, res)
+    for (let i = 0; i < 20 && status === undefined; i++) await new Promise(resolve => setImmediate(resolve))
+    return { status, body: JSON.parse(payload) }
+  }
+  assert.equal((await call()).status, 403)
+  master = true; url = false
+  assert.equal((await call()).status, 403)
+  url = true
+  assert.equal((await call()).status, 400) // Grant reached input validation; no upstream call.
+  master = false
+  assert.equal((await call()).status, 403)
 })
 
 test('参数被规范化为 JSON Schema（properties + required 数组）', () => {

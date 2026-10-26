@@ -64,6 +64,7 @@ test('validatePatch 拒绝非法输入', () => {
   assert.equal(store.validatePatch({ baseUrl: '' }), 'baseUrl 不能为空')
   assert.equal(store.validatePatch({ baseUrl: 'not a url' }), 'baseUrl 不是合法 URL')
   assert.equal(store.validatePatch({ baseUrl: 'ftp://x' }), 'baseUrl 仅支持 http/https')
+  assert.equal(store.validatePatch({ baseUrl: 'http://user:pass@host:3000' }), 'baseUrl 不能包含用户名或密码')
   assert.equal(store.validatePatch({ timeoutMs: -1 }), 'timeoutMs 必须是正数')
   assert.equal(store.validatePatch({ timeoutMs: 999999 }), 'timeoutMs 不能超过 120000')
   assert.equal(store.validatePatch({ timeoutMs: Number.NaN }), 'timeoutMs 必须是正数')

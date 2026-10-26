@@ -1,10 +1,10 @@
 /**
  * Host HTTP routes: the /api/dsh-margin family the browser half calls.
- * Loopback-only (identical trust model to dsh-trilium) — the config endpoint
- * handles the Margin credential, so it must never be reachable cross-origin.
+ * Exact plugin routes use DSH Connection's Host/Origin and browser-session checks,
+ * matching other DSH plugins while allowing authenticated remote GUI access.
  *
- * Read-only in this stage: config, test, reading list and single candidate.
- * No route writes to Margin or Trilium.
+ * Read paths plus an explicit state-assignment endpoint. Writes fail closed
+ * unless a live host permission callback grants them; nothing writes Trilium.
  *
  * Note on shape: WebRoute carries no method field, so a path that answers
  * several verbs (config: GET/PUT) dispatches on req.method itself.
@@ -12,42 +12,52 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import {
   MARGIN_API,
   type MarginApiErrorBody,
   type MarginCandidateStatus,
   type MarginConfigPatch,
   type MarginConfigView,
-  type MarginReadingView,
   type MarginTestResult,
 } from './protocol.ts'
 import { MarginAuthError, MarginClient, MarginRequestError, MarginShapeError } from './margin.ts'
 import { patchConfig, readConfig, toView, validatePatch, writeConfig } from './store.ts'
+import { makeImportRoutes, type ImportPermissions } from './importRoutes.ts'
+import { makeManagementRoutes, type ManagementPermissions } from './managementRoutes.ts'
+import { makeAiRoutes, type AiConfig, type AiPermissions } from './aiRoutes.ts'
+import type { LlmLike } from './aiContext.ts'
+import { makeSaveRoutes, type SavePermissions } from './saveRoutes.ts'
+import { makeAnnotationRoutes, type AnnotationPermissions } from './annotationRoutes.ts'
+import { makeProgressRoutes } from './progressRoutes.ts'
 
 const MAX_JSON_BODY_BYTES = 1 << 20
 
 /** Default page size for the reading list. */
 const DEFAULT_LIMIT = 60
 
-/**
- * Same-origin + loopback guard. The remote address must be loopback (dsh web
- * binds loopback; a reverse proxy therefore lands here as 127.0.0.1), and a
- * browser request must be same-origin and not cross-site. Host itself need not
- * be localhost, because the GUI is commonly served behind a proxy.
- */
-function isLoopbackRequest(req: IncomingMessage): boolean {
-  const address = req.socket.remoteAddress
-  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
-  if (req.headers['sec-fetch-site'] === 'cross-site') return false
-  const origin = req.headers.origin
-  const host = req.headers.host
-  if (origin !== undefined && host !== undefined) {
-    try {
-      return new URL(origin).host === host
-    } catch {
-      return false
-    }
-  }
+/** DSH Connection gate used to authenticate remote browser sessions and enforce Host/Origin. */
+type ConnectionGate = Pick<HostConnectionHandle, 'requestRejection'>
+
+/** Re-evaluated on every request: a mounted endpoint is not a write grant. */
+export interface RoutePermissions extends ImportPermissions, ManagementPermissions, AiPermissions, SavePermissions, AnnotationPermissions {
+  allowWrites?: () => boolean
+}
+
+function mayWrite(permissions: RoutePermissions): boolean {
+  return permissions.allowWrites?.() === true
+}
+
+/** Reject requests unless DSH Connection confirms the session and request origin. */
+function rejectUntrustedRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  connection: ConnectionGate | undefined,
+): boolean {
+  // Fail closed when the host service was not injected.
+  const status = connection?.requestRejection(req) ?? (connection === undefined ? 403 : undefined)
+  if (status === undefined) return false
+  writeJson(res, status, { error: status === 401 ? 'unauthorized' : 'forbidden: same-origin request required' })
   return true
 }
 
@@ -63,8 +73,10 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /** One error response, always in the same envelope. */
-function writeError(res: ServerResponse, status: number, code: string, message: string, category?: string): void {
-  const body: MarginApiErrorBody = { error: { code, message, ...(category === undefined ? {} : { category }) } }
+function writeError(res: ServerResponse, status: number, code: string, message: string, category?: string, count?: number): void {
+  const body: MarginApiErrorBody = {
+    error: { code, message, ...(category === undefined ? {} : { category }), ...(count === undefined ? {} : { count }) },
+  }
   writeJson(res, status, body)
 }
 
@@ -128,7 +140,6 @@ function parseOptional(raw: string | null): string | null {
 
 /** GET/PUT /config. */
 async function configRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!isLoopbackRequest(req)) return writeError(res, 403, 'forbidden', 'forbidden: loopback-only')
   const method = req.method ?? 'GET'
   if (method === 'GET') {
     writeJson(res, 200, toView(readConfig()) satisfies MarginConfigView)
@@ -154,7 +165,6 @@ async function configRoute(req: IncomingMessage, res: ServerResponse): Promise<v
 
 /** POST /test — a failed probe is a 200 with ok:false, not a transport error. */
 async function testRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!isLoopbackRequest(req)) return writeError(res, 403, 'forbidden', 'forbidden: loopback-only')
   const client = currentClient()
   if (client === undefined) {
     writeJson(res, 200, { ok: false, detail: '未配置 Margin 地址或 token' } satisfies MarginTestResult)
@@ -181,8 +191,7 @@ async function testRoute(req: IncomingMessage, res: ServerResponse): Promise<voi
 }
 
 /** GET /candidates — the reading list. */
-async function candidatesRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!isLoopbackRequest(req)) return writeError(res, 403, 'forbidden', 'forbidden: loopback-only')
+async function candidatesRoute(req: IncomingMessage, res: ServerResponse, permissions: RoutePermissions): Promise<void> {
   if ((req.method ?? 'GET') !== 'GET') return writeError(res, 405, 'method_not_allowed', '仅支持 GET')
   const client = currentClient()
   if (client === undefined) {
@@ -190,33 +199,26 @@ async function candidatesRoute(req: IncomingMessage, res: ServerResponse): Promi
     return
   }
   const url = new URL(req.url ?? '/', 'http://localhost')
-  const status = parseStatus(url.searchParams.get('status'))
+  const rawStatus = url.searchParams.get('status')
+  if (rawStatus !== null && !['unprocessed', 'read', 'processing', 'error'].includes(rawStatus)) {
+    return writeError(res, 400, 'invalid_status', '未知阅读状态')
+  }
+  const status = parseStatus(rawStatus)
   const sourceType = parseOptional(url.searchParams.get('sourceType'))
   const query = parseOptional(url.searchParams.get('q'))
   const rawLimit = Number(url.searchParams.get('limit') ?? DEFAULT_LIMIT)
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : DEFAULT_LIMIT
+  const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : DEFAULT_LIMIT
+  const rawPage = Number(url.searchParams.get('page') ?? 1)
+  if (!Number.isSafeInteger(rawPage) || rawPage <= 0) return writeError(res, 400, 'invalid_page', 'page 必须是正整数')
   try {
-    const page = await client.listCandidates({
+    const view = await client.queryReadingList({
       status,
       sourceType: sourceType ?? undefined,
       query: query ?? undefined,
+      page: rawPage,
       limit,
     })
-    // The breakdown describes the whole result set, so it is read without the
-    // free-text filter applied — it answers "what is in my backlog", not
-    // "what is on screen".
-    const tally = await client.tallyBySource(status)
-    const view: MarginReadingView = {
-      items: page.items,
-      breakdown: [...tally.counts.entries()]
-        .map(([sourceType, count]) => ({ sourceType, count }))
-        .sort((a, b) => b.count - a.count),
-      total: page.total,
-      page: page.page,
-      totalPages: page.totalPages,
-      applied: { status, sourceType, query, limit: page.items.length },
-    }
-    writeJson(res, 200, view)
+    writeJson(res, 200, { ...view, writesAllowed: mayWrite(permissions) })
   } catch (error) {
     mapClientError(res, error)
   }
@@ -224,7 +226,6 @@ async function candidatesRoute(req: IncomingMessage, res: ServerResponse): Promi
 
 /** GET /candidate?id=N — one candidate. */
 async function candidateRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!isLoopbackRequest(req)) return writeError(res, 403, 'forbidden', 'forbidden: loopback-only')
   if ((req.method ?? 'GET') !== 'GET') return writeError(res, 405, 'method_not_allowed', '仅支持 GET')
   const client = currentClient()
   if (client === undefined) {
@@ -233,7 +234,7 @@ async function candidateRoute(req: IncomingMessage, res: ServerResponse): Promis
   }
   const url = new URL(req.url ?? '/', 'http://localhost')
   const id = Number(url.searchParams.get('id'))
-  if (!Number.isInteger(id) || id <= 0) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     writeError(res, 400, 'invalid_id', 'id 必须是正整数')
     return
   }
@@ -249,12 +250,59 @@ async function candidateRoute(req: IncomingMessage, res: ServerResponse): Promis
   }
 }
 
-/** The route family. */
-export function makeRoutes(): WebRoute[] {
-  return [
+/** PATCH /candidate-status: explicit value plus instance-bound article identity. */
+async function candidateStatusRoute(req: IncomingMessage, res: ServerResponse, permissions: RoutePermissions): Promise<void> {
+  if (req.method !== 'PATCH') return writeError(res, 405, 'method_not_allowed', '仅支持 PATCH')
+  if (!mayWrite(permissions)) return writeError(res, 403, 'writes_disabled', 'Margin 写能力未启用')
+  let body: unknown
+  try { body = await readJsonBody(req) } catch {
+    return writeError(res, 400, 'bad_body', '请求体不是合法或大小合适的 JSON')
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return writeError(res, 400, 'bad_body', '请求体必须是对象')
+  const args = body as Record<string, unknown>
+  if (Object.keys(args).some(key => !['id', 'status', 'marginUrl'].includes(key))) return writeError(res, 400, 'bad_body', '包含未知字段')
+  const { id, status, marginUrl } = args
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return writeError(res, 400, 'invalid_id', 'id 必须是正整数')
+  if (status !== 'read' && status !== 'unprocessed') return writeError(res, 400, 'invalid_status', '只支持 read / unprocessed')
+  const config = readConfig()
+  if (config.baseUrl === '' || config.token === '') return writeError(res, 409, 'not_configured', '尚未配置 Margin 地址或 token')
+  const expectedUrl = `${config.baseUrl.replace(/\/+$/, '')}/reader/${id}`
+  if (marginUrl !== expectedUrl) return writeError(res, 409, 'instance_changed', 'Margin 实例已变化，请刷新列表')
+  // Authorization may have changed while the request body was being read.
+  if (!mayWrite(permissions)) return writeError(res, 403, 'writes_disabled', 'Margin 写能力未启用')
+  try {
+    const updated = await new MarginClient(config).setCandidateStatus(id, status)
+    writeJson(res, 200, updated)
+  } catch (error) {
+    mapClientError(res, error)
+  }
+}
+
+/** Every exact route is guarded by DSH Connection's session/origin policy. */
+export function makeRoutes(
+  connection?: ConnectionGate,
+  permissions: RoutePermissions = {},
+  ai: { config?: AiConfig; llm?: () => LlmLike | undefined } = {},
+): WebRoute[] {
+  const routes: WebRoute[] = [
     { kind: 'exact', path: `${MARGIN_API}/config`, handler: configRoute },
     { kind: 'exact', path: `${MARGIN_API}/test`, handler: testRoute },
-    { kind: 'exact', path: `${MARGIN_API}/candidates`, handler: candidatesRoute },
+    { kind: 'exact', path: `${MARGIN_API}/candidates`, handler: (req, res) => candidatesRoute(req, res, permissions) },
     { kind: 'exact', path: `${MARGIN_API}/candidate`, handler: candidateRoute },
+    { kind: 'exact', path: `${MARGIN_API}/candidate-status`, handler: (req, res) => candidateStatusRoute(req, res, permissions) },
+    ...makeImportRoutes(permissions, { writeJson, writeError, mapClientError, readJsonBody }),
+    ...makeManagementRoutes(permissions, { writeJson, writeError, readJsonBody }),
+    ...makeAiRoutes(permissions, ai.config ?? {}, { writeJson, writeError, readJsonBody }, ai.llm ?? (() => undefined)),
+    ...makeSaveRoutes(permissions, { writeJson, writeError, readJsonBody }),
+    ...makeAnnotationRoutes(permissions, { writeJson, writeError, readJsonBody }),
+    // Progress is local-only: it needs no content write permission and never
+    // touches Margin, so it stays available with every write gate closed.
+    ...makeProgressRoutes({ writeJson, writeError, readJsonBody }),
   ]
+  return routes.map(route => ({
+    ...route,
+    handler: (req, res) => {
+      if (!rejectUntrustedRequest(req, res, connection)) void route.handler(req, res)
+    },
+  }))
 }

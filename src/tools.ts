@@ -1,15 +1,14 @@
 /**
  * Agent tools (margin_*): the reading-list half of the capture loop.
  *
- * Read-only in this stage. `margin_mark_read` is defined here but only
- * registered when writes are explicitly enabled (see index.ts), so an agent
- * cannot change reading state by accident.
+ * Reads are always available; explicit read/unread tools are registered only
+ * when writes are enabled and recheck live authorization at execution.
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { MarginClient } from './margin.ts'
-import type { MarginCandidate, MarginCandidateStatus } from './protocol.ts'
+import type { MarginCandidate, MarginCandidateStatus, MarginReadStatus } from './protocol.ts'
 
 /** One text content block (the only render shape these tools emit). */
 function text(value: string): ContentBlock[] {
@@ -82,13 +81,14 @@ export function marginListTool(getClient: () => MarginClient | undefined) {
       if (typeof client === 'string') return client
       const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.min(args.limit, 100) : 30
       try {
-        const page = await client.listCandidates({
+        const page = await client.queryReadingList({
           status: toStatus(args.status),
           sourceType: args.sourceType,
           query: args.query,
           limit,
         })
-        return `Margin 共 ${page.total} 条匹配，返回 ${page.items.length} 条：\n${renderCandidates(page.items)}`
+        const scope = page.totalExact ? '共' : `扫描 ${page.scannedTotal} 条后观察到（结果可能不完整）`
+        return `Margin ${scope} ${page.total} 条匹配，返回 ${page.items.length} 条：\n${renderCandidates(page.items)}`
       } catch (error) {
         return failure(error)
       }
@@ -113,7 +113,7 @@ export function marginGetTool(getClient: () => MarginClient | undefined) {
       const client = requireClient(getClient())
       if (typeof client === 'string') return client
       const id = Number(args.id)
-      if (!Number.isInteger(id) || id <= 0) return 'id 必须是正整数。'
+      if (!Number.isSafeInteger(id) || id <= 0) return 'id 必须是正整数。'
       try {
         const candidate = await client.getCandidate(id)
         if (candidate === undefined) return `Margin 中不存在 candidate ${id}。`
@@ -136,30 +136,39 @@ export function marginGetTool(getClient: () => MarginClient | undefined) {
   })
 }
 
-/** Mark a candidate read. Registered only when writes are enabled. */
-export function marginMarkReadTool(getClient: () => MarginClient | undefined) {
+/** Explicit, idempotent state assignment; recheck live permissions at execution. */
+function statusTool(getClient: () => MarginClient | undefined, mayWrite: () => boolean, status: MarginReadStatus) {
+  const read = status === 'read'
   return defineTool({
-    name: 'margin_mark_read',
-    description: 'Mark one Margin candidate as read (explicit value, never a toggle). ' +
-      'Use only after the user states the article is finished. Triggers: mark it read, I finished this one, 这篇读完了.',
+    name: read ? 'margin_mark_read' : 'margin_mark_unread',
+    description: read
+      ? 'Mark one Margin candidate as read (explicit value, never a toggle). Use only after the user states the article is finished. Triggers: mark it read, I finished this one, 这篇读完了.'
+      : 'Set one Margin candidate to unread (explicit unprocessed value, never a toggle). Use only after an explicit user request to mark unread. Does not reopen Trilium tasks.',
     parameters: {
-      id: { type: 'integer', required: true, description: 'Margin candidate id to mark read.' },
+      id: { type: 'integer', required: true, description: 'Candidate id in the currently configured Margin instance.' },
     },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value: string) => text(value),
-    },
+    output: { schema: { type: 'string' }, render: (_args, value: string) => text(value) },
     async execute(args) {
+      if (!mayWrite()) return 'Margin 写能力未启用。'
       const client = requireClient(getClient())
       if (typeof client === 'string') return client
       const id = Number(args.id)
-      if (!Number.isInteger(id) || id <= 0) return 'id 必须是正整数。'
+      if (!Number.isSafeInteger(id) || id <= 0) return 'id 必须是正整数。'
       try {
-        const updated = await client.setCandidateStatus(id, 'read')
-        return `已将 candidate ${updated.id} 标记为 read：${updated.title}`
+        if (!mayWrite()) return 'Margin 写能力未启用。'
+        const updated = await client.setCandidateStatus(id, status)
+        return `已将 candidate ${updated.id} 设为 ${updated.status}。`
       } catch (error) {
-        return failure(error)
+        return `${failure(error)}；结果未确认，请先重新读取状态，不要自动重试写入。`
       }
     },
   })
+}
+
+export function marginMarkReadTool(getClient: () => MarginClient | undefined, mayWrite: () => boolean = () => false) {
+  return statusTool(getClient, mayWrite, 'read')
+}
+
+export function marginMarkUnreadTool(getClient: () => MarginClient | undefined, mayWrite: () => boolean = () => false) {
+  return statusTool(getClient, mayWrite, 'unprocessed')
 }

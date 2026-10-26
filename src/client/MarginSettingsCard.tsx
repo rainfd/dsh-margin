@@ -13,7 +13,7 @@ export type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import { useEffect, useState, type CSSProperties } from 'react'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MarginApi } from './api.ts'
-import type { MarginConfigView } from '../protocol.ts'
+import type { MarginConfigView, MarginProgressView } from '../protocol.ts'
 
 /** The registration-side face the slot entry injects. */
 export interface MarginSettingsFace {
@@ -98,9 +98,16 @@ export function MarginSettingsCard(props: MarginSettingsCardProps) {
   const [testing, setTesting] = useState(false)
   const [testDetail, setTestDetail] = useState('')
   const [error, setError] = useState('')
+  // Local reading progress is the only plugin-owned data a user may want gone.
+  const [progressCount, setProgressCount] = useState<number | null>(null)
+  const [clearing, setClearing] = useState(false)
+  const [cleared, setCleared] = useState<number | null>(null)
 
   useEffect(() => {
     let cancelled = false
+    api.loadProgress(1)
+      .then((view: MarginProgressView) => { if (!cancelled) setProgressCount(view.total) })
+      .catch(() => { if (!cancelled) setProgressCount(null) })
     api.loadConfig()
       .then((view: MarginConfigView) => {
         if (cancelled) return
@@ -140,6 +147,20 @@ export function MarginSettingsCard(props: MarginSettingsCardProps) {
       setError(cause instanceof Error ? cause.message : '保存失败')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const clearLocalProgress = async (): Promise<void> => {
+    setClearing(true)
+    setError('')
+    try {
+      const reply = await api.clearProgress()
+      setCleared(reply.removed)
+      setProgressCount(0)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '清除失败')
+    } finally {
+      setClearing(false)
     }
   }
 
@@ -189,6 +210,22 @@ export function MarginSettingsCard(props: MarginSettingsCardProps) {
         disabled={loading}
         onEdit={value => setForm(current => ({ ...current, timeoutMs: value }))}
       />
+      <div style={fieldStyle}>
+        <div style={{ ...labelStyle }}>本地阅读进度</div>
+        <div style={hintStyle}>
+          只存在本机（实例 + 正文版本 + 位置），不写入 Margin，也不代表已读。
+          {progressCount === null ? '' : ` 当前 ${progressCount} 条。`}
+          {cleared === null ? '' : ` 已清除 ${cleared} 条，Margin 文章与状态未受影响。`}
+        </div>
+        <button
+          type="button"
+          style={{ ...buttonStyle, alignSelf: 'flex-start' }}
+          disabled={clearing || loading}
+          onClick={() => { void clearLocalProgress() }}
+        >
+          {clearing ? '清除中…' : '清除本地阅读进度'}
+        </button>
+      </div>
       <div style={{ display: 'flex', gap: 8, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-border-l2)', alignItems: 'center' }}>
         <button type="button" style={buttonStyle} disabled={saving || loading} onClick={() => { void save() }}>
           {saving ? t('settings.saving') : t('settings.save')}

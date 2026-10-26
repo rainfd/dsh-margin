@@ -70,6 +70,70 @@ test('列表按 status/page_size 传参并解析分页', async () => {
   )
 })
 
+test('待读链接指向当前 Margin reader，保留原文且不含凭据', async () => {
+  await withServer(
+    () => ({ body: { items: [row(), row({ id: 866, source_url: '' })], pagination: { total: 2 } } }),
+    async ({ client, port }) => {
+      const page = await client({ baseUrl: `http://127.0.0.1:${port}///` }).listCandidates()
+      assert.equal(page.items[0].marginUrl, `http://127.0.0.1:${port}/reader/865`)
+      assert.equal(page.items[0].sourceUrl, 'https://example.com/a')
+      assert.equal(page.items[1].marginUrl, `http://127.0.0.1:${port}/reader/866`)
+      assert.equal(JSON.stringify(page).includes('secret-token'), false)
+    },
+  )
+})
+
+test('详情链接使用所属实例地址，不混用其他实例', async () => {
+  await withServer(
+    () => ({ body: row() }),
+    async ({ client, port }) => {
+      const candidate = await client().getCandidate(865)
+      assert.equal(candidate.marginUrl, `http://127.0.0.1:${port}/reader/865`)
+    },
+  )
+})
+
+test('详情保留 Markdown/纯文本及提取失败标记，不暴露 HTML', async () => {
+  await withServer(
+    () => ({ body: row({ content_md: '# 正文\n\n![图](https://example.com/a.png)', content_text: '正文', content_html: '<script>bad()</script>', content_fetch_failed: true }) }),
+    async ({ client }) => {
+      const detail = await client().getCandidate(865)
+      assert.equal(detail.contentMd, '# 正文\n\n![图](https://example.com/a.png)')
+      assert.equal(detail.contentText, '正文')
+      assert.equal(detail.contentFetchFailed, true)
+      assert.equal('content_html' in detail, false)
+      assert.equal(JSON.stringify(detail).includes('secret-token'), false)
+    },
+  )
+})
+
+test('缺失/null/异常类型的正文字段安全降级，不用摘要冒充全文', async () => {
+  for (const fields of [{}, { content_md: null, content_text: null }, { content_md: {}, content_text: 42, content_fetch_failed: 'true' }]) {
+    await withServer(
+      () => ({ body: row(fields) }),
+      async ({ client }) => {
+        const detail = await client().getCandidate(865)
+        assert.equal(detail.contentMd, '')
+        assert.equal(detail.contentText, '')
+        assert.equal(detail.contentFetchFailed, false)
+        assert.equal(detail.summaryText, 'AI 摘要')
+      },
+    )
+  }
+})
+
+test('列表即使上游附带全文也不保留正文', async () => {
+  await withServer(
+    () => ({ body: { items: [row({ content_md: 'full body', content_text: 'full body', content_html: '<p>full body</p>' })], pagination: { total: 1 } } }),
+    async ({ client }) => {
+      const { items } = await client().listCandidates()
+      assert.equal('contentMd' in items[0], false)
+      assert.equal('contentText' in items[0], false)
+      assert.equal(JSON.stringify(items).includes('full body'), false)
+    },
+  )
+})
+
 test('凭据以 X-Auth-Token 发送', async () => {
   await withServer(
     () => ({ body: { items: [], pagination: { total: 0 } } }),
@@ -135,6 +199,27 @@ test('非 JSON 响应映射为结构错误', async () => {
   try {
     const client = new MarginClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, token: 't', timeoutMs: 3000 })
     await assert.rejects(() => client.listCandidates(), MarginShapeError)
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('非 JSON 的 404 错误保留状态，仍能区分“文章不存在”', async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(404, { 'content-type': 'text/html' })
+    res.end('<html>proxy: not found</html>')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const client = new MarginClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, token: 't', timeoutMs: 3000 })
+    await assert.rejects(() => client.listCandidates(), error => {
+      assert.ok(error instanceof MarginRequestError)
+      assert.equal(error.status, 404)
+      assert.equal(error.message.includes('t'), false)
+      return true
+    })
+    // getCandidate translates the typed 404 to "no such row".
+    assert.equal(await client.getCandidate(42), undefined)
   } finally {
     await new Promise(resolve => server.close(resolve))
   }
@@ -220,7 +305,7 @@ test('setCandidateStatus 发送显式 status，不是 toggle', async () => {
     req.on('end', () => {
       received = { method: req.method, path: req.url, body: JSON.parse(body || '{}') }
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(row({ status: 'read' })))
+      res.end(JSON.stringify({ id: 865, status: 'read', is_saved_to_trilium: true, updated_at: '2026-10-25T10:00:00Z' }))
     })
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -230,10 +315,54 @@ test('setCandidateStatus 发送显式 status，不是 toggle', async () => {
     assert.equal(received.method, 'PATCH')
     assert.equal(received.path, '/api/candidates/865/status')
     assert.deepEqual(received.body, { status: 'read' })
-    assert.equal(updated.status, 'read')
+    assert.deepEqual(updated, {
+      id: 865, status: 'read', isSavedToTrilium: true, updatedAt: '2026-10-25T10:00:00Z',
+    })
+    assert.equal('title' in updated, false)
+    assert.equal('summaryText' in updated, false)
   } finally {
     await new Promise(resolve => server.close(resolve))
   }
+})
+
+test('状态写入在网络请求前拒绝非法 ID 和非读写目标', async () => {
+  await withServer(() => ({ body: {} }), async ({ client, seen }) => {
+    for (const id of [0, -1, 1.1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '865', null, undefined]) {
+      await assert.rejects(() => client().setCandidateStatus(id, 'read'), MarginShapeError)
+    }
+    for (const status of ['processing', 'error', '', 'READ', null, undefined, {}, true]) {
+      await assert.rejects(() => client().setCandidateStatus(865, status), MarginShapeError)
+    }
+    assert.equal(seen.length, 0)
+  })
+})
+
+test('状态确认必须匹配请求 ID 和目标状态，不能虚报成功', async () => {
+  for (const ack of [{ id: 866, status: 'read' }, { id: 865, status: 'unprocessed' }, {}, null, { id: '865', status: 'read' }]) {
+    await withServer(() => ({ body: ack }), async ({ client }) => {
+      await assert.rejects(() => client().setCandidateStatus(865, 'read'), MarginShapeError)
+    })
+  }
+})
+
+test('未读状态设置返回真实部分确认，重复设置不会 toggle', async () => {
+  await withServer(() => ({ body: { id: 865, status: 'unprocessed', is_saved_to_trilium: false, updated_at: 'now' } }), async ({ client, seen }) => {
+    const margin = client()
+    assert.equal((await margin.setCandidateStatus(865, 'unprocessed')).status, 'unprocessed')
+    assert.equal((await margin.setCandidateStatus(865, 'unprocessed')).status, 'unprocessed')
+    assert.equal(seen.length, 2)
+  })
+})
+
+test('原始单页列表来源本地精确过滤，页长上限100且不透传不支持参数', async () => {
+  await withServer(() => ({ body: { items: [row({ id: 1, source_type: 'rss' }), row({ id: 2, source_type: 'wechat' })], pagination: { total: 2 } } }), async ({ client, seen }) => {
+    const result = await client().listCandidates({ sourceType: 'wechat', pageSize: 200, query: '样本' })
+    assert.deepEqual(result.items.map(item => item.id), [2])
+    assert.equal(result.total, 2)
+    assert.equal(seen[0].search.get('page_size'), '100')
+    assert.equal(seen[0].search.has('source_type'), false)
+    assert.equal(seen[0].search.has('query'), false)
+  })
 })
 
 test('tallyBySource 跨页累加并按来源分组', async () => {

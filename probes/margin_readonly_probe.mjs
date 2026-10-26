@@ -75,7 +75,16 @@ const missing = await client.getCandidate(999999999)
 check('不存在的 id 返回 undefined', missing === undefined)
 
 // 6. Route family answers the sidebar's request, through a real socket.
-const routes = makeRoutes()
+// Test-only gate for this loopback harness, not the real DSH session service.
+// Production route admission is covered by registration/routes tests and must
+// still be verified through an authenticated existing GUI session.
+const routes = makeRoutes({
+  requestRejection(req) {
+    if (req.socket.remoteAddress !== '127.0.0.1' || req.headers['sec-fetch-site'] === 'cross-site') return 403
+    if (req.headers.origin !== undefined && new URL(req.headers.origin).host !== req.headers.host) return 403
+    return undefined
+  },
+})
 const host = createServer((req, res) => {
   const route = routes.find(candidate => req.url.split('?')[0] === candidate.path)
   if (route === undefined) {

@@ -90,6 +90,9 @@ export function validatePatch(patch: MarginConfigPatch): string | undefined {
       return 'baseUrl 不是合法 URL'
     }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return 'baseUrl 仅支持 http/https'
+    // Credentials in the endpoint would be embedded in every marginUrl and
+    // rendered as a link. Import URLs already reject them; the config must too.
+    if (parsed.username !== '' || parsed.password !== '') return 'baseUrl 不能包含用户名或密码'
   }
   if (patch.token !== undefined && typeof patch.token !== 'string') return 'token 必须是字符串'
   if (patch.timeoutMs !== undefined) {
