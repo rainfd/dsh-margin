@@ -4,6 +4,17 @@
 
 **当前阶段：默认只读的阅读工作台。** 列表内点击「阅读」按需加载 Markdown 正文，缺失时降级为纯文本；支持状态、来源、搜索和分页。打开文章不会自动标记已读。仅显式启用写能力后，界面和 agent 才可按用户动作设为已读/未读；URL/PDF 导入另需各自开关，202 仅表示已接受。保存到 Trilium 是唯一的 Trilium 写入路径，由 Margin 自己的保存接口执行，默认关闭。
 
+## 多项目 Superagent 接入
+
+同一套多项目 Superagent 现在同时接入 Margin 阅读后端与 Trilium 任务面板，由 `dsh-margin` / `dsh-trilium` 两个插件分别负责：
+
+| 仓库 | 负责 | 真源 |
+|---|---|---|
+| `dsh-margin`（本仓库） | Margin 阅读侧：待读/已读列表、正文阅读器、受控导入与阅读状态写入、AI 问答入口 | Margin：文章与阅读状态 |
+| [`dsh-trilium`](https://github.com/rainfd/dsh-trilium) | Trilium 任务侧：`#task` 任务面板（状态/项目、搜索排序、新建编辑）及记忆、笔记、搜索、周报等 ETAPI 能力 | Trilium：任务账本 |
+
+两边各守真源：Margin 保存文章与阅读状态，Trilium 保存任务账本；跨系统对账（如按文章建任务、完成后回写）由 agent 流程按需编排。
+
 ## 分阶段迁移
 
 迁移按独立 spec 推进，依赖、验收标准和进展见 [实施路线](docs/specs/README.md)。保留 Margin 后端作为内容与阅读状态唯一真源，先统一 DSH 内的使用入口，不重写采集引擎或迁移数据库。
